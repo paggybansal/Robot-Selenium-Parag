@@ -1,32 +1,37 @@
 """Source-agnostic retrieval of a PDQA Glue run's log text.
 
-Parsing (glue_log_parser) is deliberately decoupled from transport: CloudWatch
-API, the framework's AwsLogManager, or a saved 'output.logs' file all produce the
-same string. Falls back gracefully and always reports which source was used.
+Parsing (glue_log_parser) is deliberately decoupled from transport: the CloudWatch
+API, the framework's AwsLogManager, or a saved 'output.logs' file all yield the
+same string. Sources are tried in order and the one used is always reported.
+
+  api     — strict stream lookup (logStreamNamePrefix == JobRunId)  → ownership PROVEN
+  manager — framework AwsLogManager.log_events()                    → ownership WEAK
+  file    — saved output.logs (+ GLUE_LOG_URL)                      → PROVEN if URL given
 """
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Pattern, Sequence, Tuple
+from typing import List, Optional, Pattern, Sequence
 
 from action_api_framework.utils.console_reporter import ConsoleReporter as R
 
 _TRANSPORT_ERRORS = (
     "EndpointConnectionError", "ConnectTimeoutError", "ReadTimeoutError",
-    "SSLError", "ProxyConnectionError", "ConnectionClosedError",
+    "SSLError", "ProxyConnectionError", "ConnectionClosedError", "ConnectionError",
 )
+
+VALID_SOURCES = ("auto", "api", "manager", "file")
 
 
 @dataclass
 class GlueLogText:
     text: str
     messages: List[str]
-    source: str                 # 'api' | 'manager' | 'file'
-    artifact: Optional[Path]    # local file we parsed / saved
-    run_id_verified: bool       # True only when stream identity was proven
+    source: str                  # 'api' | 'manager' | 'file'
+    artifact: Optional[Path]     # local file parsed / saved
+    run_id_verified: bool        # True only when run ownership was proven
 
 
 # ════════════════════════════════════════════════════════════
@@ -39,11 +44,8 @@ def _normalise_events(events) -> List[str]:
     if isinstance(events, str):
         return events.splitlines()
     out: List[str] = []
-    for e in events:
-        if isinstance(e, dict):
-            out.append(str(e.get("message", e)))
-        else:
-            out.append(str(e))
+    for event in events:
+        out.append(str(event.get("message", event)) if isinstance(event, dict) else str(event))
     return out
 
 
@@ -58,12 +60,17 @@ def _candidate_dirs(extra: Optional[str]) -> List[Path]:
         dirs.append(Path(extra))
     cwd = Path.cwd()
     dirs += [cwd, cwd / "logs", cwd / "results", cwd / "results" / "logs",
-             cwd / "test_logs", Path(__file__).resolve().parent.parent / "logs"]
+             cwd / "test_logs", cwd / "reports",
+             Path(__file__).resolve().parent.parent / "logs"]
     seen, unique = set(), []
-    for d in dirs:
-        if d.is_dir() and d.resolve() not in seen:
-            seen.add(d.resolve())
-            unique.append(d)
+    for directory in dirs:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if directory.is_dir() and resolved not in seen:
+            seen.add(resolved)
+            unique.append(directory)
     return unique
 
 
@@ -82,11 +89,13 @@ def _find_log_file(run_id: Optional[str], explicit: Optional[str],
 
     for directory in _candidate_dirs(search_dir):
         for pattern in patterns:
-            hits = sorted(directory.rglob(pattern),
-                          key=lambda p: p.stat().st_mtime, reverse=True)
-            hits = [h for h in hits if h.is_file() and h.stat().st_size > 0]
+            try:
+                hits = [h for h in directory.rglob(pattern)
+                        if h.is_file() and h.stat().st_size > 0]
+            except OSError:
+                continue
             if hits:
-                return hits[0]
+                return max(hits, key=lambda p: p.stat().st_mtime)
     return None
 
 
@@ -100,8 +109,8 @@ def _from_api(reader, log_group: str, run_id: str, sentinel: Pattern,
         timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
     artifact = None
     try:
-        artifact = reader.save(messages, run_id)
-    except Exception as exc:
+        artifact = Path(str(reader.save(messages, run_id)))
+    except Exception as exc:                                  # noqa: BLE001
         R.warning(f"Could not persist log artifact: {exc}")
     return GlueLogText(text, messages, "api", artifact, run_id_verified=True)
 
@@ -109,7 +118,6 @@ def _from_api(reader, log_group: str, run_id: str, sentinel: Pattern,
 def _from_manager(log_manager, log_group: str, run_id: str, sentinel: Pattern,
                   timeout_seconds: int, poll_seconds: int) -> GlueLogText:
     deadline = time.time() + timeout_seconds
-    messages: List[str] = []
     while True:
         messages = _normalise_events(log_manager.log_events(run_id, log_group))
         text = "\n".join(messages)
@@ -117,12 +125,11 @@ def _from_manager(log_manager, log_group: str, run_id: str, sentinel: Pattern,
             artifact = None
             try:
                 artifact = Path(str(log_manager.write_log_to_test_dir(messages, run_id)))
-            except Exception as exc:
+            except Exception as exc:                          # noqa: BLE001
                 R.warning(f"Could not persist log artifact: {exc}")
             # AwsLogManager.log_events() falls back to the most recent stream,
-            # so stream identity is NOT proven here.
-            verified = run_id in text
-            return GlueLogText(text, messages, "manager", artifact, verified)
+            # so stream identity is NOT guaranteed here.
+            return GlueLogText(text, messages, "manager", artifact, run_id in text)
         if time.time() >= deadline:
             raise AssertionError(
                 f"AwsLogManager returned {len(messages)} event(s) for run {run_id} but the "
@@ -132,19 +139,34 @@ def _from_manager(log_manager, log_group: str, run_id: str, sentinel: Pattern,
 
 
 def _from_file(run_id: Optional[str], explicit: Optional[str], search_dir: Optional[str],
-               sentinel: Pattern) -> GlueLogText:
+               sentinel: Pattern, url_stream: Optional[str] = None) -> GlueLogText:
     path = _find_log_file(run_id, explicit, search_dir)
     if path is None:
         raise AssertionError(
             "No local Glue log file found. Set GLUE_LOG_FILE=<path to output.logs> "
-            "(CloudWatch console → log stream → Download/copy) or GLUE_LOG_DIR=<folder>.")
+            "and (recommended) GLUE_LOG_URL=<console URL you downloaded it from>.")
+
     text = path.read_text(encoding="utf-8", errors="replace")
     if not sentinel.search(text):
         raise AssertionError(
-            f"Local log file '{path}' does not contain the expected "
-            f"'Chunk N written to s3://…' line — wrong file or truncated download.\n"
-            f"Last 500 chars:\n{text[-500:]}")
-    verified = bool(run_id and run_id in text) or bool(run_id and run_id in path.name)
+            f"Local log file '{path}' has no 'Chunk N written to s3://…' line — "
+            f"wrong file or truncated download.\nLast 500 chars:\n{text[-500:]}")
+
+    # Ownership evidence, strongest first:
+    #   1. console URL's stream == our JobRunId  (definitive)
+    #   2. run id appears in the text or the filename
+    verified = False
+    if url_stream and run_id:
+        if str(url_stream).strip() == str(run_id).strip():
+            R.success(f"GLUE_LOG_URL stream matches JobRunId ({run_id}) — ownership proven")
+            verified = True
+        else:
+            raise AssertionError(
+                f"GLUE_LOG_URL is for stream '{url_stream}' but this run is '{run_id}'. "
+                f"You are about to validate the WRONG job run — re-download the log.")
+    elif run_id and (run_id in text or run_id in path.name):
+        verified = True
+
     return GlueLogText(text, text.splitlines(), "file", path, verified)
 
 
@@ -155,13 +177,19 @@ def read_run_log(*, mode: str, run_id: Optional[str], log_group: str,
                  sentinel: Pattern, timeout_seconds: int, poll_seconds: int,
                  reader=None, log_manager=None,
                  log_file: Optional[str] = None,
-                 log_dir: Optional[str] = None) -> GlueLogText:
+                 log_dir: Optional[str] = None,
+                 url_stream: Optional[str] = None) -> GlueLogText:
+    """Return the Glue run's log text from the first available source.
+
+    url_stream: log-stream name parsed from GLUE_LOG_URL. When supplied it is
+    used to PROVE that a locally saved log file belongs to this JobRunId.
+    """
     mode = (mode or "auto").strip().lower()
-    order: Sequence[str]
-    if mode == "auto":
-        order = ("api", "manager", "file") if run_id else ("file",)
-    else:
-        order = (mode,)
+    if mode not in VALID_SOURCES:
+        raise AssertionError(f"Unknown log source '{mode}'; expected one of {VALID_SOURCES}")
+
+    order: Sequence[str] = (("api", "manager", "file") if run_id else ("file",)) \
+        if mode == "auto" else (mode,)
 
     failures: List[str] = []
     for source in order:
@@ -174,25 +202,22 @@ def read_run_log(*, mode: str, run_id: Optional[str], log_group: str,
                                    timeout_seconds, poll_seconds)
             elif source == "manager":
                 if not (log_manager and run_id):
-                    raise AssertionError("manager source requires a log_manager and run_id")
+                    raise AssertionError("manager source requires a log_manager and a run_id")
                 result = _from_manager(log_manager, log_group, run_id, sentinel,
                                        timeout_seconds, poll_seconds)
-            elif source == "file":
-                result = _from_file(run_id, log_file, log_dir, sentinel)
-            else:
-                raise AssertionError(f"Unknown GLUE_LOG_SOURCE '{source}' "
-                                     f"(expected auto|api|manager|file)")
+            else:                                             # file
+                result = _from_file(run_id, log_file, log_dir, sentinel, url_stream)
 
             R.success(f"Glue log obtained from source='{result.source}' "
                       f"({len(result.messages)} line(s))"
                       + (f", artifact={result.artifact}" if result.artifact else ""))
             if not result.run_id_verified:
-                R.warning(f"Log source '{result.source}' could not prove the log belongs to "
+                R.warning(f"Source '{result.source}' could not prove the log belongs to "
                           f"run_id={run_id}. Ownership will be enforced via the S3 object "
-                          f"referenced inside the log.")
+                          f"referenced inside the log (step 6c).")
             return result
 
-        except Exception as exc:               # noqa: BLE001 — fall through to next source
+        except Exception as exc:                              # noqa: BLE001
             hint = " (network/TLS — 'logs.' endpoint likely blocked or proxied)" \
                 if _is_transport_error(exc) else ""
             failures.append(f"{source}: {type(exc).__name__}: {exc}{hint}")
@@ -201,6 +226,6 @@ def read_run_log(*, mode: str, run_id: Optional[str], log_group: str,
     raise AssertionError(
         "Could not obtain the Glue run log from any source.\n  - "
         + "\n  - ".join(failures)
-        + "\nQuick unblock: download the log stream to a file and set "
-          "GLUE_LOG_SOURCE=file GLUE_LOG_FILE=<path>."
+        + "\nQuick unblock: download the log stream from the CloudWatch console, then set "
+          "GLUE_LOG_SOURCE=file, GLUE_LOG_FILE=<path>, GLUE_LOG_URL=<console URL>."
     )
