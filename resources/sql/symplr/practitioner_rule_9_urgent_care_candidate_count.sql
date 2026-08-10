@@ -1,5 +1,5 @@
 /*
-Rule 9 — Count unique PractitionerLocation candidates.
+Rule 9 — Count unique eligible PractitionerLocation records.
 */
 
 SELECT
@@ -13,23 +13,19 @@ INNER JOIN dbo.Practitioners AS p
 INNER JOIN dbo.PracticeLocations AS pl_service
     ON pl_service.LocationID = pl.LocationID
    AND pl_service.Archived = 'N'
-   AND pl_service.LocationTypeID IN (
-        SELECT pt.PracticeTypeID
-        FROM dbo.PracticeTypes AS pt
-        WHERE pt.PracticeTypeName = 'Service'
-          AND pt.Archived = 'N'
-   )
+
+INNER JOIN dbo.PracticeTypes AS service_practice_type
+    ON service_practice_type.PracticeTypeID = pl_service.LocationTypeID
+   AND service_practice_type.PracticeTypeName = 'Service'
 
 INNER JOIN dbo.PracticeLocations AS pl_billing
     ON pl_billing.NationalProviderID = pl_service.NationalProviderID
    AND pl_billing.PracticeID = pl_service.PracticeID
    AND pl_billing.Archived = 'N'
-   AND pl_billing.LocationTypeID IN (
-        SELECT pt.PracticeTypeID
-        FROM dbo.PracticeTypes AS pt
-        WHERE pt.PracticeTypeName = 'Billing'
-          AND pt.Archived = 'N'
-   )
+
+INNER JOIN dbo.PracticeTypes AS billing_practice_type
+    ON billing_practice_type.PracticeTypeID = pl_billing.LocationTypeID
+   AND billing_practice_type.PracticeTypeName = 'Billing'
 
 INNER JOIN dbo.LocationServices AS ls
     ON ls.LocationID = pl_billing.LocationID
@@ -45,26 +41,30 @@ INNER JOIN dbo.ServiceCategoryTypes AS sct
    AND sct.Archived = 'N'
    AND sct.ServiceCategoryTypeName = 'Urgent Care Center'
 
+INNER JOIN dbo.UserFields AS location_verification_uf
+    ON location_verification_uf.ParentRecID =
+       pl.PractitionerLocationRecID
+   AND location_verification_uf.Archived = 'N'
+
+INNER JOIN dbo.UserDefinedFields AS location_verification_udf
+    ON location_verification_udf.UserDefinedFieldID =
+       location_verification_uf.UserDefinedFieldID
+   AND location_verification_udf.Archived = 'N'
+   AND location_verification_udf.FieldName =
+       'Location Verification Status'
+
+INNER JOIN dbo.UserDefinedListFields AS location_verification_udlf
+    ON location_verification_udlf.UserDefinedFieldID =
+       location_verification_udf.UserDefinedFieldID
+   AND location_verification_udlf.UserDefinedListFieldID =
+       location_verification_uf.UserDefinedListFieldID
+   AND location_verification_udlf.Archived = 'N'
+   AND location_verification_udlf.Value = 'Correct'
+
 WHERE pl.Archived = 'N'
   AND pl.InDirectory = 'Y'
 
-  AND p.NationalProviderID IS NOT NULL
-
-  AND EXISTS (
-        SELECT 1
-        FROM dbo.UserFields AS uf
-
-        INNER JOIN dbo.UserDefinedFields AS udf
-            ON udf.UserDefinedFieldID = uf.UserDefinedFieldID
-           AND udf.Archived = 'N'
-
-        INNER JOIN dbo.UserDefinedListFields AS udlf
-            ON udlf.UserDefinedFieldID = udf.UserDefinedFieldID
-           AND udlf.UserDefinedListFieldID = uf.UserDefinedListFieldID
-           AND udlf.Archived = 'N'
-
-        WHERE uf.ParentRecID = pl.PractitionerLocationRecID
-          AND uf.Archived = 'N'
-          AND udf.FieldName = 'Location Verification Status'
-          AND udlf.Value = 'Correct'
-  );
+  AND NULLIF(
+        LTRIM(RTRIM(CONVERT(VARCHAR(50), p.NationalProviderID))),
+        ''
+  ) IS NOT NULL;
