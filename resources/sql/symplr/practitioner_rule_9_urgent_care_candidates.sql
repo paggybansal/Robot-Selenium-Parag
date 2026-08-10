@@ -1,23 +1,25 @@
 /*
-Rule 9 — Urgent Care Practitioner Location Suppression.
+Rule 9 — Urgent Care Practitioner Location suppression.
 
 A PractitionerLocation qualifies when:
 
 1. PractitionerLocations.InDirectory = 'Y'
 
-2. PractitionerLocation is linked to a Service PracticeLocation.
+2. PractitionerLocation is associated with a Service PracticeLocation.
 
-3. The Service PracticeLocation has a related Billing PracticeLocation
-   with the same PracticeID and NationalProviderID.
+3. The Service PracticeLocation has a matching Billing PracticeLocation
+   for the same PracticeID and NationalProviderID.
 
-4. The Billing PracticeLocation has a LocationService where:
+4. The Billing PracticeLocation has LocationServices where:
        ServiceTypeName = 'Practice type'
        ServiceCategoryTypeName = 'Urgent Care Center'
 
-5. PractitionerLocation has active Location Verification Status = Correct.
+5. PractitionerLocation has:
+       Location Verification Status = 'Correct'
 
-Dynamic token:
-    {top_n}
+The NPI condition is included because Rule 9 StatusDB validation requires:
+
+    process_id + NationalProviderID
 */
 
 SELECT DISTINCT TOP ({top_n})
@@ -36,14 +38,16 @@ SELECT DISTINCT TOP ({top_n})
 
     pl_service.PracticeID,
     pl_service.LocationID AS ServiceLocationID,
+    service_practice_type.PracticeTypeName AS ServiceLocationTypeName,
 
     pl_billing.LocationID AS BillingLocationID,
+    billing_practice_type.PracticeTypeName AS BillingLocationTypeName,
 
     ls.LocationServiceRecID,
     st.ServiceTypeName,
     sct.ServiceCategoryTypeName,
 
-    'Correct' AS LocationVerificationStatus
+    location_verification_udlf.Value AS LocationVerificationStatus
 
 FROM dbo.PractitionerLocations AS pl
 
@@ -51,27 +55,26 @@ INNER JOIN dbo.Practitioners AS p
     ON p.PractitionerID = pl.PractitionerID
    AND p.Archived = 'N'
 
+/* Practitioner service location */
 INNER JOIN dbo.PracticeLocations AS pl_service
     ON pl_service.LocationID = pl.LocationID
    AND pl_service.Archived = 'N'
-   AND pl_service.LocationTypeID IN (
-        SELECT pt.PracticeTypeID
-        FROM dbo.PracticeTypes AS pt
-        WHERE pt.PracticeTypeName = 'Service'
-          AND pt.Archived = 'N'
-   )
 
+INNER JOIN dbo.PracticeTypes AS service_practice_type
+    ON service_practice_type.PracticeTypeID = pl_service.LocationTypeID
+   AND service_practice_type.PracticeTypeName = 'Service'
+
+/* Matching practice billing location */
 INNER JOIN dbo.PracticeLocations AS pl_billing
     ON pl_billing.NationalProviderID = pl_service.NationalProviderID
    AND pl_billing.PracticeID = pl_service.PracticeID
    AND pl_billing.Archived = 'N'
-   AND pl_billing.LocationTypeID IN (
-        SELECT pt.PracticeTypeID
-        FROM dbo.PracticeTypes AS pt
-        WHERE pt.PracticeTypeName = 'Billing'
-          AND pt.Archived = 'N'
-   )
 
+INNER JOIN dbo.PracticeTypes AS billing_practice_type
+    ON billing_practice_type.PracticeTypeID = pl_billing.LocationTypeID
+   AND billing_practice_type.PracticeTypeName = 'Billing'
+
+/* Urgent Care classification on Billing Location */
 INNER JOIN dbo.LocationServices AS ls
     ON ls.LocationID = pl_billing.LocationID
    AND ls.Archived = 'N'
@@ -86,29 +89,35 @@ INNER JOIN dbo.ServiceCategoryTypes AS sct
    AND sct.Archived = 'N'
    AND sct.ServiceCategoryTypeName = 'Urgent Care Center'
 
+/* Location Verification Status = Correct */
+INNER JOIN dbo.UserFields AS location_verification_uf
+    ON location_verification_uf.ParentRecID =
+       pl.PractitionerLocationRecID
+   AND location_verification_uf.Archived = 'N'
+
+INNER JOIN dbo.UserDefinedFields AS location_verification_udf
+    ON location_verification_udf.UserDefinedFieldID =
+       location_verification_uf.UserDefinedFieldID
+   AND location_verification_udf.Archived = 'N'
+   AND location_verification_udf.FieldName =
+       'Location Verification Status'
+
+INNER JOIN dbo.UserDefinedListFields AS location_verification_udlf
+    ON location_verification_udlf.UserDefinedFieldID =
+       location_verification_udf.UserDefinedFieldID
+   AND location_verification_udlf.UserDefinedListFieldID =
+       location_verification_uf.UserDefinedListFieldID
+   AND location_verification_udlf.Archived = 'N'
+   AND location_verification_udlf.Value = 'Correct'
+
 WHERE pl.Archived = 'N'
   AND pl.InDirectory = 'Y'
 
-  AND p.NationalProviderID IS NOT NULL
-
-  AND EXISTS (
-        SELECT 1
-        FROM dbo.UserFields AS uf
-
-        INNER JOIN dbo.UserDefinedFields AS udf
-            ON udf.UserDefinedFieldID = uf.UserDefinedFieldID
-           AND udf.Archived = 'N'
-
-        INNER JOIN dbo.UserDefinedListFields AS udlf
-            ON udlf.UserDefinedFieldID = udf.UserDefinedFieldID
-           AND udlf.UserDefinedListFieldID = uf.UserDefinedListFieldID
-           AND udlf.Archived = 'N'
-
-        WHERE uf.ParentRecID = pl.PractitionerLocationRecID
-          AND uf.Archived = 'N'
-          AND udf.FieldName = 'Location Verification Status'
-          AND udlf.Value = 'Correct'
-  )
+  /* Required for StatusDB process_id + NPI validation */
+  AND NULLIF(
+        LTRIM(RTRIM(CONVERT(VARCHAR(50), p.NationalProviderID))),
+        ''
+  ) IS NOT NULL
 
 ORDER BY
     p.PractitionerID,
