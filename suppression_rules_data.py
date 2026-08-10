@@ -124,6 +124,24 @@ class DirectorySuppressionRule:
     expected_modified_by: str = "dataloader"
     enforce_modified_by: bool = False
 
+    # Candidate SQL values for non-Rule-15/non-Claim-Hold-Reason rules.
+    #
+    # Rule 15 keeps this empty and uses the existing UDF binding logic.
+    candidate_query_params: Tuple[str, ...] = ()
+
+    # Additional candidate validations performed by test_01.
+    #
+    # Example:
+    # (
+    #     ("ServiceLocationTypeName", "Service"),
+    #     ("BillingLocationTypeName", "Billing"),
+    # )
+    candidate_preconditions: Tuple[Tuple[str, str], ...] = ()
+
+    # Rule 15 candidate SQL returns QualifyingValue.
+    # Rule 9 does not use Claim Hold Reason and must set this to False.
+    requires_qualifying_udf: bool = True
+
     # ── Legacy compatibility properties ────────────────────────────────
     #
     # These let existing code that still references rule.outbound_key_columns
