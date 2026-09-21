@@ -6,7 +6,7 @@ Documentation       End-to-end negative validation for Practice Rule:
 ...                 Strategy:
 ...                 - Fetch an active Practice's NPI+TIN from the live DB.
 ...                 - Upload a CSV containing incompatible type classifications:
-...                     • PracticeTypeName = Solo Practitioner
+...                     • PracticeTypeName = Primary Care
 ...                     • BillingServiceTypeName = Dentistry
 ...                     • BillingServiceCategoryTypeName = Cardiology
 ...                 - Rule engine should detect the mismatch and fire BRG_0004.
@@ -131,14 +131,14 @@ Upload File And Get Tracking Number
 
     # ═══════════════════════════════════════════════════════════════
     # 🎯 CREATE PRACTICE CSV WITH MISMATCH
-    # 🔴 KEY: PracticeTypeName (Solo) conflicts with the service specialties
+    # 🔴 KEY: PracticeTypeName (Primary Care) conflicts with Cardiology Specialty
     # ═══════════════════════════════════════════════════════════════
     &{practice_overrides}=    Create Dictionary
     # ─── Practice Core ───
     ...    NationalProviderID=${test_data}[GroupNationalProviderID]
     ...    TaxIDNumber=${test_data}[PracticeTaxIDNumber]
     ...    PracticeName=${test_data}[PracticeName]
-    ...    PracticeTypeName=${test_data}[MismatchedPracticeTypeName]                 # Solo Practitioner
+    ...    PracticeTypeName=${test_data}[MismatchedPracticeTypeName]                 # Primary Care
     ...    Notes=Negative test - PracticeTypeServCatCheck (env: ${ENV}, live DB)
     ...    ElectronicBillingCapability=N
     # ─── Billing Address ───
